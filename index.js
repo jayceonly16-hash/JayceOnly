@@ -1,5 +1,5 @@
 require("dotenv").config();
-const fs = require("fs");
+
 const {
   Client,
   GatewayIntentBits,
@@ -9,15 +9,74 @@ const {
   EmbedBuilder
 } = require("discord.js");
 
-const DATA_FILE = "./card-list.json";
+const { google } = require("googleapis");
 
-function loadData() {
-  if (!fs.existsSync(DATA_FILE)) return [];
-  return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const SHEET_NAME = "Sheet1";
+
+function getAuth() {
+  return new google.auth.JWT({
+    email: process.env.GOOGLE_CLIENT_EMAIL,
+    key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+  });
 }
 
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+async function getSheets() {
+  const auth = getAuth();
+  return google.sheets({ version: "v4", auth });
+}
+
+async function getRows() {
+  const sheets = await getSheets();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A:I`
+  });
+
+  const rows = res.data.values || [];
+  return rows.slice(1);
+}
+
+async function appendRow(row) {
+  const sheets = await getSheets();
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A:I`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: {
+      values: [row]
+    }
+  });
+}
+
+async function updateStatus(id, status) {
+  const rows = await getRows();
+  const rowIndex = rows.findIndex(row => String(row[0]) === String(id));
+
+  if (rowIndex === -1) return false;
+
+  const sheetRowNumber = rowIndex + 2;
+
+  const sheets = await getSheets();
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!H${sheetRowNumber}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: {
+      values: [[status]]
+    }
+  });
+
+  return true;
+}
+
+async function clearRows() {
+  const sheets = await getSheets();
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A2:I`
+  });
 }
 
 const commands = [
@@ -67,72 +126,74 @@ client.once("ready", () => {
 client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
-  const data = loadData();
+  try {
+    if (interaction.commandName === "addlist") {
+      const rows = await getRows();
+      const id = rows.length + 1;
 
-  if (interaction.commandName === "addlist") {
-    const item = {
-      id: data.length + 1,
-      user: interaction.user.username,
-      userId: interaction.user.id,
-      card: interaction.options.getString("card"),
-      language: interaction.options.getString("language"),
-      condition: interaction.options.getString("condition"),
-      budget: interaction.options.getString("budget"),
-      quantity: interaction.options.getInteger("quantity"),
-      note: interaction.options.getString("note") || "None",
-      status: "Active",
-      createdAt: new Date().toLocaleString("en-GB")
-    };
+      const row = [
+        id,
+        interaction.user.username,
+        interaction.options.getString("card"),
+        interaction.options.getString("language"),
+        interaction.options.getString("condition"),
+        interaction.options.getString("budget"),
+        interaction.options.getInteger("quantity"),
+        interaction.options.getString("note") || "None",
+        "Active",
+        new Date().toLocaleString("en-GB")
+      ];
 
-    data.push(item);
-    saveData(data);
+      await appendRow(row);
 
-    return interaction.reply(`✅ Request #${item.id} added: ${item.card}`);
-  }
-
-  if (interaction.commandName === "list") {
-    if (data.length === 0) {
-      return interaction.reply("There are no card requests right now.");
+      return interaction.reply(`✅ Request #${id} added: ${row[2]}`);
     }
 
-    const text = data
-      .map(item => {
-        return `#${item.id} | ${item.status}
-Customer: <@${item.userId}>
-Card: ${item.card}
-Language: ${item.language}
-Condition: ${item.condition}
-Budget: ${item.budget}
-Quantity: ${item.quantity}
-Note: ${item.note}`;
-      })
-      .join("\n\n");
+    if (interaction.commandName === "list") {
+      const rows = await getRows();
 
-    const embed = new EmbedBuilder()
-      .setTitle("📋 Current Card Request List")
-      .setDescription(text.slice(0, 4000))
-      .setFooter({ text: "Pokeunion Bot" });
+      if (rows.length === 0) {
+        return interaction.reply("There are no card requests right now.");
+      }
 
-    return interaction.reply({ embeds: [embed] });
-  }
+      const text = rows.map(row => {
+        return `#${row[0]} | ${row[8] || "Active"}
+Customer: ${row[1]}
+Card: ${row[2]}
+Language: ${row[3]}
+Condition: ${row[4]}
+Budget: ${row[5]}
+Quantity: ${row[6]}
+Note: ${row[7] || "None"}`;
+      }).join("\n\n");
 
-  if (interaction.commandName === "done") {
-    const id = interaction.options.getInteger("id");
-    const item = data.find(x => x.id === id);
+      const embed = new EmbedBuilder()
+        .setTitle("📋 Current Card Request List")
+        .setDescription(text.slice(0, 4000))
+        .setFooter({ text: "Pokeunion Bot | Google Sheets" });
 
-    if (!item) return interaction.reply("Request ID not found.");
+      return interaction.reply({ embeds: [embed] });
+    }
 
-    item.status = "Completed";
-    saveData(data);
+    if (interaction.commandName === "done") {
+      const id = interaction.options.getInteger("id");
+      const ok = await updateStatus(id, "Completed");
 
-    return interaction.reply(`✅ Request #${id} marked as completed: ${item.card}`);
-  }
+      if (!ok) return interaction.reply("Request ID not found.");
 
-  if (interaction.commandName === "clearlist") {
-    saveData([]);
-    return interaction.reply("🧹 All card requests have been cleared.");
+      return interaction.reply(`✅ Request #${id} marked as completed.`);
+    }
+
+    if (interaction.commandName === "clearlist") {
+      await clearRows();
+      return interaction.reply("🧹 All card requests have been cleared.");
+    }
+  } catch (error) {
+    console.error(error);
+    return interaction.reply("❌ Something went wrong. Please check the bot logs.");
   }
 });
 
-registerCommands();
-client.login(process.env.DISCORD_TOKEN);
+registerCommands()
+  .then(() => client.login(process.env.DISCORD_TOKEN))
+  .catch(console.error);
